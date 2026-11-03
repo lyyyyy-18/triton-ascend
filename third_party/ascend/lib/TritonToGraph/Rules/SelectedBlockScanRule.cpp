@@ -961,37 +961,36 @@ static bool matchTiles(ScanMatchContext &ctx) {
   if (kLoad->getParentRegion() != &branch.getThenRegion() ||
       vLoad->getParentRegion() != &branch.getThenRegion())
     return false;
+  // The additive form comes in two spellings: the original two-level addptr
+  // chain with an explicit mask (the hand-written dq variant the rule was first
+  // built on), and production nsa_bwd_dq's tt.make_tensor_ptr plus
+  // boundaryCheck. The addptr spelling is tried first; when it does not hold,
+  // the shared mptr path below runs and the additive geometry check after it
+  // covers both spellings.
+  bool useAddPtrTiles = false;
+  int64_t kFreeExtent = 0;
+  int64_t vFreeExtent = 0;
   if (additive) {
-    // The additive form: no mptr at all. Both tiles are matched from their
-    // two-level addptr chain, their explicit mask and their token-range bound.
-    if (!matchAddPtrTile(kLoad, rawIndex, loop, kTile) ||
-        !matchAddPtrTile(vLoad, rawIndex, loop, vTile))
-      return false;
-    // Both tiles must cover the same token block and carry the same
-    // token-range mask: the builder rebuilds one bound for both.
-    if (kTile.blockSize != vTile.blockSize ||
-        kTile.tokenBound != vTile.tokenBound)
-      return false;
-    blockSize = kTile.blockSize;
-    kTokenOffset = kTile.blockStart;
-    vTokenOffset = vTile.blockStart;
-    // dot(ds[G, BS], k^T[BS, F]) -> acc[G, F]: both tile free axes must be
-    // the accumulator's column count and both dots must produce [G, BS].
-    auto accType = cast<RankedTensorType>(loop.getInitArgs()[0].getType());
-    if (accType.getRank() != 2)
-      return false;
-    auto isScoreTile = [&](Type type) {
-      auto ranked = dyn_cast<RankedTensorType>(type);
-      return ranked && ranked.getRank() == 2 &&
-             ranked.getElementType().isF32() &&
-             ranked.getShape()[0] == accType.getShape()[0] &&
-             ranked.getShape()[1] == blockSize;
-    };
-    if (!isScoreTile(scoreDot.getType()) || !isScoreTile(valueDot.getType()) ||
-        kTile.freeExtent != accType.getShape()[1] ||
-        vTile.freeExtent != accType.getShape()[1])
-      return false;
-  } else {
+    AddPtrTile kAddPtrTile;
+    AddPtrTile vAddPtrTile;
+    if (matchAddPtrTile(kLoad, rawIndex, loop, kAddPtrTile) &&
+        matchAddPtrTile(vLoad, rawIndex, loop, vAddPtrTile)) {
+      // Both tiles must cover the same token block and carry the same
+      // token-range mask: the builder rebuilds one bound for both.
+      if (kAddPtrTile.blockSize != vAddPtrTile.blockSize ||
+          kAddPtrTile.tokenBound != vAddPtrTile.tokenBound)
+        return false;
+      kTile = kAddPtrTile;
+      vTile = vAddPtrTile;
+      blockSize = kTile.blockSize;
+      kTokenOffset = kTile.blockStart;
+      vTokenOffset = vTile.blockStart;
+      kFreeExtent = kTile.freeExtent;
+      vFreeExtent = vTile.freeExtent;
+      useAddPtrTiles = true;
+    }
+  }
+  if (!useAddPtrTiles) {
     // The rewrite loads each tile unconditionally, so a per-element mask, an
     // "other" padding value or a volatile qualifier on the tile loads is out
     // of scope.
@@ -1085,6 +1084,37 @@ static bool matchTiles(ScanMatchContext &ctx) {
           return false;
       }
     }
+  }
+  // The additive geometry is spelling independent: dot(ds[G, BS], k^T[BS, F])
+  // -> acc[G, F] means both tile free axes are the accumulator's column count
+  // and both dots produce [G, BS].
+  if (additive) {
+    if (!useAddPtrTiles) {
+      // The mptr spelling carries the free extent as the block shape on the
+      // axis that is not the token axis.
+      auto freeExtentOf = [&](triton::MakeTensorPtrOp ptr,
+                              unsigned tokenAxis) -> int64_t {
+        auto ptrType = cast<triton::PointerType>(ptr.getType());
+        auto blockType = cast<RankedTensorType>(ptrType.getPointeeType());
+        return blockType.getShape()[1 - tokenAxis];
+      };
+      kFreeExtent = freeExtentOf(kPtr, kTokenAxis);
+      vFreeExtent = freeExtentOf(vPtr, vTokenAxis);
+    }
+    auto accType = cast<RankedTensorType>(loop.getInitArgs()[0].getType());
+    if (accType.getRank() != 2)
+      return false;
+    auto isScoreTile = [&](Type type) {
+      auto ranked = dyn_cast<RankedTensorType>(type);
+      return ranked && ranked.getRank() == 2 &&
+             ranked.getElementType().isF32() &&
+             ranked.getShape()[0] == accType.getShape()[0] &&
+             ranked.getShape()[1] == blockSize;
+    };
+    if (!isScoreTile(scoreDot.getType()) || !isScoreTile(valueDot.getType()) ||
+        kFreeExtent != accType.getShape()[1] ||
+        vFreeExtent != accType.getShape()[1])
+      return false;
   }
   // The block predicates must scale the index by the same BS as the tile
   // offsets.
@@ -2065,7 +2095,11 @@ static bool buildSelectedBlockScan(IRRewriter &rewriter,
   // ---- K/V tiles. The two templates read the same two tiles per
   // iteration; only the addressing differs. ----
   Value bK, bV;
-  if (!additive) {
+  if (!additive || candidate.kPtr) {
+    // The online-softmax form always reads through make_tensor_ptr; the
+    // additive form does too when the baseline spelled the tiles that way
+    // (production nsa_bwd_dq), and only the addptr spelling needs the rebuilt
+    // two-level chain below.
     buildMakeTensorPtrTile(rewriter, loc, candidate, BN, tokenStart,
                            prologue, bK, bV);
   }
@@ -2076,9 +2110,9 @@ static bool buildSelectedBlockScan(IRRewriter &rewriter,
   Value tokens = weights.tokens;
   Value valid = weights.valid;
 
-  if (additive) {
-    // Additive tiles: the baseline's own two-level addptr at the scan tile's
-    // token start, with the token-range mask preserved.
+  if (additive && !candidate.kPtr) {
+    // Additive tiles, addptr spelling: the baseline's own two-level addptr at
+    // the scan tile's token start, with the token-range mask preserved.
     bK = buildAddPtrTileLoad(rewriter, loc, candidate.kTile,
                              candidate.kLoad, tokens);
     bV = buildAddPtrTileLoad(rewriter, loc, candidate.vTile,
