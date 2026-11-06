@@ -29,6 +29,7 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Twine.h"
+#include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
 
 #if TRITON_ASCEND_HAS_INPROC_COSTMODEL
@@ -39,6 +40,8 @@
 #include <limits>
 #include <tuple>
 #include <utility>
+
+#define DEBUG_TYPE "resource-cost"
 
 using namespace mlir;
 using namespace triton;
@@ -80,8 +83,25 @@ bool isUBResidentTensor(Value value) {
   if (!value)
     return false;
   auto tensor = dyn_cast<RankedTensorType>(value.getType());
-  return tensor && tensor.hasStaticShape() &&
-         isa<FloatType>(tensor.getElementType());
+  if (!tensor || !tensor.hasStaticShape())
+    return false;
+  // 整数张量（索引网格、地址向量、i1 掩码、下标表）同样在 UB 里落地，之前只
+  // 认浮点元素类型，导致行提升展开出来的地址向量完全漏算。元素宽度一律按实际
+  // 位宽统计（getElementBitWidth），地址向量由此按 i32 计 4 字节/元素，而不是
+  // 按 !tt.ptr 隐含的 64 位地址计 8 字节。
+  // 指针张量本身不重复计入：它的地址语义已经由配对的整数偏移张量表达，两边都
+  // 算会把同一份地址占用记两遍。
+  // Integer tensors (index grids, address vectors, i1 masks, index tables) are
+  // also materialised in UB; the old float-only filter dropped the address vectors
+  // that row lifting expands, so they were never budgeted.  Widths follow the
+  // actual element width, which makes an address vector cost 4 bytes per element
+  // (i32) instead of the 8 the !tt.ptr element type would imply.  Pointer tensors
+  // are not counted separately: the paired integer offset tensor already expresses
+  // the same address footprint, so counting both would double it.
+  Type elementType = tensor.getElementType();
+  if (isa<triton::PointerType>(elementType))
+    return false;
+  return isa<FloatType, IntegerType>(elementType);
 }
 
 bool isStorageViewOperation(Operation *operation) {
@@ -365,6 +385,23 @@ std::optional<uint64_t> cfg::getStaticTensorBytes(Type type) {
   if (!elementBits || *elementBits == 0)
     return std::nullopt;
 
+  // UB 按字节寻址：后端把 i1 掩码这类窄元素按「1 字节/元素」落地，而不是位
+  // 紧凑。实测 bishengir 的 hivm IR 里 memref<4x16x256x1xi1> 占 16 KiB
+  // （16384 个元素 = 16384 B，正好 1 B/元素），按位宽折算会把掩码低估 8 倍，
+  // 而掩码正是 SelectedBlockScan/QueryRowBatching 提升后常驻 UB 的大头之一
+  // （多缓冲后还会被复制 3~5 份）。因此先把元素宽度向上取整到整字节，再乘
+  // 元素数。
+  // UB is byte-addressed: the backend materialises narrow elements such as i1
+  // masks at one byte per element rather than bit-packed.  A bishengir hivm
+  // memref<4x16x256x1xi1> occupies 16 KiB (16384 elements = 16384 B, i.e.
+  // exactly 1 B/element), so dividing by 8 under-counts masks 8x -- and masks
+  // are among the biggest UB residents the SelectedBlockScan / QueryRowBatching
+  // lifting adds (the backend then replicates them 3~5x when multi-buffering).
+  // Round the element width up to whole bytes before multiplying by the element
+  // count.
+  const uint64_t elementBytes =
+      std::max<uint64_t>(1, (static_cast<uint64_t>(*elementBits) + 7) / 8);
+
   uint64_t elements = 1;
   for (int64_t dimension : tensor.getShape()) {
     if (dimension < 0)
@@ -373,12 +410,10 @@ std::optional<uint64_t> cfg::getStaticTensorBytes(Type type) {
       return std::nullopt;
   }
 
-  uint64_t totalBits = 0;
-  if (!checkedMul(elements, *elementBits, totalBits))
+  uint64_t totalBytes = 0;
+  if (!checkedMul(elements, elementBytes, totalBytes))
     return std::nullopt;
-  if (totalBits > std::numeric_limits<uint64_t>::max() - 7)
-    return std::nullopt;
-  return (totalBits + 7) / 8;
+  return totalBytes;
 }
 
 LiveByteEstimate cfg::estimatePeakLiveBytes(Operation *root) {
@@ -524,6 +559,7 @@ LiveByteEstimate cfg::estimatePeakLiveBytes(Operation *root) {
   llvm::sort(positions);
   positions.erase(std::unique(positions.begin(), positions.end()),
                   positions.end());
+  uint64_t bestPosition = 0;
   for (uint64_t position : positions) {
     llvm::SmallVector<const IntervalState *, 16> live;
     for (const auto &entry : intervals) {
@@ -556,7 +592,22 @@ LiveByteEstimate cfg::estimatePeakLiveBytes(Operation *root) {
       selected.push_back(state);
     }
     estimate.peakLiveBytes = std::max(estimate.peakLiveBytes, liveBytes);
+    if (liveBytes >= estimate.peakLiveBytes)
+      bestPosition = position;
   }
+
+  LLVM_DEBUG({
+    const uint64_t peakPosition = bestPosition;
+    llvm::dbgs() << "resource-cost: peak " << estimate.peakLiveBytes
+                 << " bytes at position " << peakPosition << "\n";
+    for (const auto &entry : intervals) {
+      const IntervalState &state = entry.second;
+      if (state.begin > peakPosition || peakPosition > state.end)
+        continue;
+      llvm::dbgs() << "  live " << state.bytes << " bytes "
+                   << state.value.getType() << "\n";
+    }
+  });
 
   estimate.known = true;
   estimate.reason = ResourceCostRejectReason::None;
