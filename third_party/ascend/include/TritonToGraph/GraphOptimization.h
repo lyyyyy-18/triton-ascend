@@ -66,11 +66,31 @@ enum class GraphOptimizationRuleId : GraphOptimizationRuleMask {
   IntermediatePrecisionBoundaryElision = 8192,
   StoreCoveragePlanning = 16384,
   ContiguousBlockAccessFormation = 32768,
+  // SelectedBlockScanRule：把按下标表取块的稀疏循环改写成按 token 顺序的扫描，必须
+  // 在 QueryRowBatchingRule 之前完成。默认关闭（opt-in），且没有独立落地路径——它只
+  // 在自己的沙箱里调用 the row lift，由后者决定是否采纳。
+  // SelectedBlockScanRule rewrites the table-indexed sparse gather loop into a
+  // token-order scan, before QueryRowBatchingRule lifts the rows.  Default-off
+  // (opt-in), and it has no landing path of its own: it materialises the row lift
+  // inside its own sandbox and lets that rewrite decide.
+  SelectedBlockScan = 65536,
+  // QueryRowBatchingRule：把一组 R 个查询行的稀疏块循环合并进一个 program，使一块
+  // K/V tile 服务这 R 行。它与 RowCoalescing 共用 RowLiftBuilder，但 matcher 独立，
+  // 因此两条规则可分别开关；按 RFC #2686 与 IAT 同处 ProgramMapping 阶段。
+  // QueryRowBatchingRule merges R query rows of a table-indexed sparse block loop into
+  // one program so a single K/V tile feeds all of them.  It shares RowLiftBuilder with
+  // RowCoalescing but owns its own matcher, so the two rules stay independently gated;
+  // RFC #2686 places it in the ProgramMapping phase, alongside IAT.
+  QueryRowBatching = 131072,
 };
 
 enum class GraphOptimizationRulePhase : uint8_t {
   DiagonalMaskRemoval,
   ConvertModuloToMask,
+  // SelectedBlockScanRule 紧跟地址线性化之后执行，让后面带预算的访存类规则看到顺序扫描形态。
+  // SelectedBlockScanRule runs right after address linearization so the budgeted
+  // memory-access rules below already see the sequential-scan form.
+  SelectedBlockScan,
   ProgramMapping,
   PersistentTaskMapping,
   LoadStoreTranspose,
@@ -117,6 +137,10 @@ getGraphOptimizationRuleName(GraphOptimizationRuleId rule) {
     return "StoreCoveragePlanningRule";
   case GraphOptimizationRuleId::ContiguousBlockAccessFormation:
     return "ContiguousBlockAccessFormationRule";
+  case GraphOptimizationRuleId::SelectedBlockScan:
+    return "SelectedBlockScanRule";
+  case GraphOptimizationRuleId::QueryRowBatching:
+    return "QueryRowBatchingRule";
   }
   return "Unknown";
 }
@@ -151,6 +175,17 @@ getGraphOptimizationRulePhase(GraphOptimizationRuleId rule) {
     return GraphOptimizationRulePhase::StoreCoalescing;
   case GraphOptimizationRuleId::ContiguousBlockAccessFormation:
     return GraphOptimizationRulePhase::ContiguousBlockAccessFormation;
+  // SelectedBlockScanRule 必须在 QueryRowBatchingRule 检查循环之前完成改写，因此该
+  // 阶段排在所有带预算的访存阶段之前。
+  // The scan rewrite must finish before the row lift inspects the loop, which is why
+  // this phase sits before every budgeted memory-access phase.
+  case GraphOptimizationRuleId::SelectedBlockScan:
+    return GraphOptimizationRulePhase::SelectedBlockScan;
+  // 按 RFC #2686，QueryRowBatchingRule 与 IAT 同处 ProgramMapping 阶段。
+  // QueryRowBatchingRule runs in the ProgramMapping phase, alongside IAT, as specified
+  // by RFC #2686.
+  case GraphOptimizationRuleId::QueryRowBatching:
+    return GraphOptimizationRulePhase::ProgramMapping;
   case GraphOptimizationRuleId::RowCoalescing:
     return GraphOptimizationRulePhase::RowCoalescing;
   case GraphOptimizationRuleId::StridedAxisCoalescing:
@@ -161,7 +196,7 @@ getGraphOptimizationRulePhase(GraphOptimizationRuleId rule) {
   return GraphOptimizationRulePhase::Compatibility;
 }
 
-constexpr std::array<GraphOptimizationRuleId, 15>
+constexpr std::array<GraphOptimizationRuleId, 17>
     kGraphOptimizationRuleRegistry = {
         GraphOptimizationRuleId::LoadStoreTranspose,
         GraphOptimizationRuleId::TransposePointwiseReorder,
@@ -178,6 +213,8 @@ constexpr std::array<GraphOptimizationRuleId, 15>
         GraphOptimizationRuleId::IntermediatePrecisionBoundaryElision,
         GraphOptimizationRuleId::StoreCoveragePlanning,
         GraphOptimizationRuleId::ContiguousBlockAccessFormation,
+        GraphOptimizationRuleId::SelectedBlockScan,
+        GraphOptimizationRuleId::QueryRowBatching,
 };
 
 constexpr bool hasUniqueSingleBitGraphOptimizationRuleIds() {
@@ -227,7 +264,9 @@ constexpr GraphOptimizationRuleMask kKnownGraphOptimizationRuleMask =
     getGraphOptimizationRuleMask(
         GraphOptimizationRuleId::StoreCoveragePlanning) |
     getGraphOptimizationRuleMask(
-        GraphOptimizationRuleId::ContiguousBlockAccessFormation);
+        GraphOptimizationRuleId::ContiguousBlockAccessFormation) |
+    getGraphOptimizationRuleMask(GraphOptimizationRuleId::SelectedBlockScan) |
+    getGraphOptimizationRuleMask(GraphOptimizationRuleId::QueryRowBatching);
 
 constexpr GraphOptimizationRuleMask kDefaultEligibleGraphOptimizationRuleMask =
     kLegacyGraphOptimizationRuleMask |
@@ -236,6 +275,15 @@ constexpr GraphOptimizationRuleMask kDefaultEligibleGraphOptimizationRuleMask =
     getGraphOptimizationRuleMask(
         GraphOptimizationRuleId::PersistentTaskStripMining);
 
+// 固定默认关闭：这些规则位是已知的、可以用 rule-mask 显式打开，但不进默认包。
+// #2686 的 SelectedBlockScanRule / QueryRowBatchingRule 在这里按 RFC #2686 保持
+// 显式 opt-in：扫描改写会改变浮点归约顺序（fwd 的扫描 tile 比一个 block 宽），
+// 行提升把 R 个查询行合并进一个 program，两者都依赖具体形状与预算才划算。
+// Fixed default-off: these bits are known and can be enabled through the rule mask,
+// but they are not part of the default bundle.  RFC #2686 keeps SelectedBlockScanRule
+// and QueryRowBatchingRule opt-in for that reason: the scan rewrite reorders the
+// floating-point reduction (the fwd scan tile is wider than one block) and the row
+// lift merges R query rows into one program, and both pay off only for some shapes.
 constexpr GraphOptimizationRuleMask kFixedDefaultOffGraphOptimizationRuleMask =
     getGraphOptimizationRuleMask(
         GraphOptimizationRuleId::ResidentLoadForwarding) |
@@ -244,7 +292,9 @@ constexpr GraphOptimizationRuleMask kFixedDefaultOffGraphOptimizationRuleMask =
     getGraphOptimizationRuleMask(
         GraphOptimizationRuleId::StoreCoveragePlanning) |
     getGraphOptimizationRuleMask(
-        GraphOptimizationRuleId::ContiguousBlockAccessFormation);
+        GraphOptimizationRuleId::ContiguousBlockAccessFormation) |
+    getGraphOptimizationRuleMask(GraphOptimizationRuleId::SelectedBlockScan) |
+    getGraphOptimizationRuleMask(GraphOptimizationRuleId::QueryRowBatching);
 
 constexpr GraphOptimizationRuleMask kDefaultGraphOptimizationRuleMask =
     kDefaultEligibleGraphOptimizationRuleMask;
@@ -256,7 +306,10 @@ static_assert(kLegacyGraphOptimizationRuleMask == 511,
               "legacy graph optimization rule mask is an ABI contract");
 static_assert(kDefaultGraphOptimizationRuleMask ==
                   kDefaultEligibleGraphOptimizationRuleMask,
-              "IAT and PTSM must remain enabled by default");
+              "the default set must stay equal to the default-eligible set");
+static_assert(kDefaultGraphOptimizationRuleMask == 3071,
+              "default graph rule mask stays 3071: the #2686 SelectedBlockScan and "
+              "QueryRowBatching bits are fixed default-off (RFC #2686)");
 static_assert(kKnownGraphOptimizationRuleMask ==
                   (kDefaultEligibleGraphOptimizationRuleMask |
                    kFixedDefaultOffGraphOptimizationRuleMask),
@@ -277,6 +330,16 @@ static_assert(static_cast<unsigned>(getGraphOptimizationRulePhase(
                   static_cast<unsigned>(getGraphOptimizationRulePhase(
                       GraphOptimizationRuleId::ContiguousBlockAccessFormation)),
               "store planning must run before access formation");
+static_assert(static_cast<unsigned>(getGraphOptimizationRulePhase(
+                  GraphOptimizationRuleId::ConvertModuloToMask)) <
+                  static_cast<unsigned>(getGraphOptimizationRulePhase(
+                      GraphOptimizationRuleId::SelectedBlockScan)),
+              "modulo-to-mask must run before the selected-block scan");
+static_assert(static_cast<unsigned>(getGraphOptimizationRulePhase(
+                  GraphOptimizationRuleId::SelectedBlockScan)) <
+                  static_cast<unsigned>(getGraphOptimizationRulePhase(
+                      GraphOptimizationRuleId::IndependentAxisTensorize)),
+              "selected-block scan must run before program mapping");
 
 constexpr bool
 isValidGraphOptimizationRuleMask(GraphOptimizationRuleMask ruleMask) {
@@ -317,6 +380,12 @@ struct GraphOptimizationOptions {
   unsigned mappingL0BCapacityBytes = 0;
   unsigned mappingL0CCapacityBytes = 0;
   unsigned l0SafetyPercent = 80;
+  // 启动时实际调度的物理核块数（纯 SIMT 用 AIV，其余用 AIC）。行数策略用它
+  // 保证按 R 合并后仍能铺满一轮核；0 表示未知，关闭 gridX/R >= coreNum 检查。
+  // Physical AI-core blocks the launcher schedules (AIV for pure-SIMT kernels,
+  // AIC otherwise).  The row-count policy keeps one full wave after R-way
+  // coalescing; zero disables the gridX/R >= coreNum check.
+  unsigned coreNum = 0;
   // RowCoalescing changes the launch grid and is valid only for
   // compile_mode="simt_only".  Keep the source selector rather than a
   // second derived force flag so every consumer follows one mode contract.
