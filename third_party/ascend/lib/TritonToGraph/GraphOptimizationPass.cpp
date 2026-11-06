@@ -626,6 +626,13 @@ void populateBuiltinGraphOptimizationRules(
                     GraphOptimizationRuleId::SelectedBlockScan)) {
     rules.push_back(createSelectedBlockScanRule());
   }
+  // QueryRowBatchingRule 在规则位 131072 置位时注册（同样默认关闭）；它在
+  // ProgramMapping 阶段独立调度，而此时循环通常已被 SelectedBlockScanRule 的
+  // materialize 处理过，在这里是幂等的。
+  if (isRuleEnabled(options.enabledRuleMask,
+                    GraphOptimizationRuleId::QueryRowBatching)) {
+    rules.push_back(createQueryRowBatchingRule());
+  }
   const auto compileMode =
       triton::ascend::parseCompileMode(options.compileMode);
   if (compileMode && isRuleEnabled(options.enabledRuleMask,
